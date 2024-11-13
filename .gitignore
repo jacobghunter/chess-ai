@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# folder housing stockfish binary
+/stockfish
+
+# svgs
+*.svg
+
 # C extensions
 *.so
 
