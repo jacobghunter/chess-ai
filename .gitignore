@@ -3,8 +3,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+
+# saved pytorch files
+*.pth
+
 # folder housing stockfish binary
 /stockfish
+
+# lichess database
+/Lichess Elite Database
 
 # svgs
 *.svg
