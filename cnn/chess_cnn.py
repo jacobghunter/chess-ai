@@ -15,10 +15,10 @@ class ChessCNN(nn.Module):
         # Fully connected layers after the convolutional layers
         self.fc1 = nn.Linear(256 * 8 * 8, 512)
 
-        # Output layer: 130 values representing the encoded best move (start square, end square, color, piece type)
-        self.fc2 = nn.Linear(512, 130)
+        # This will output the logits for each possible move
+        self.fc2 = nn.Linear(512, 12 * 8 * 8)
 
-    def forward(self, x, available_moves):
+    def forward(self, x, available_moves_mask):
         # Process the board state through the convolutional layers
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
@@ -30,7 +30,12 @@ class ChessCNN(nn.Module):
         # Pass through the first fully connected layer
         x = torch.relu(self.fc1(x))
 
-        # Output layer to get logits for the best move (130 values)
-        move_logits = self.fc2(x)
+        logits = self.fc2(x)
 
-        return move_logits
+        # unsure if this is necessary
+        logits = logits.view(-1, 12, 8, 8)
+
+        # Available moves mask is also 12x8x8
+        masked_logits = logits * available_moves_mask
+
+        return masked_logits
