@@ -6,8 +6,10 @@ import torch
 import torch.nn as nn
 from chess_cnn import ChessCNN
 from chess_dataset import ChessDataset
-import os
 from torch.utils.data import DataLoader
+from custom_loss import CustomMoveLoss
+from torch.optim.lr_scheduler import StepLR
+import os
 
 PIECE_MAP = {
     chess.PAWN: 0,
@@ -61,10 +63,10 @@ def encode_move(move, board):
 
 
 def bitboard_to_tensor(board):
-    # Initialize an empty 12-channel tensor of shape (8, 8, 12)
+    # Initialize an empty 12-channel tensor of shape (12, 8, 8)
     board_tensor = np.zeros((12, 8, 8), dtype=int)
 
-    # Loop through each piece type (6 for white and 6 for black)
+    # Loop through each piece type (1 to 6 for pawn to king)
     for piece_type in range(1, 7):  # piece types range from 1 (pawn) to 6 (king)
         for color in [chess.WHITE, chess.BLACK]:
             piece = chess.Piece(piece_type, color)
@@ -73,18 +75,22 @@ def bitboard_to_tensor(board):
             # Update the corresponding bitboard channel
             for pos in piece_positions:
                 row, col = divmod(pos, 8)
+
+                if color == chess.WHITE:
+                    # For black pieces, reverse the row index (flip vertically)
+                    row = 7 - row  # Flip the row for white pieces
+
                 # Mark the position of the piece in the correct channel
-                board_tensor[(color == chess.WHITE)
-                             * 6 + piece.piece_type - 1, row, col] = 1
+                board_tensor[(color == chess.BLACK) * 6 +
+                             piece.piece_type - 1, row, col] = 1
 
     return torch.tensor(board_tensor)
 
 
 def move_to_tensor(board, move):
-    # TODO: maybe I need the rest of the pieces on this as well? unsure
-
-    # Initialize an empty 12x8x8 tensor for the label
-    move_tensor = np.zeros((12, 8, 8), dtype=int)
+    # Initialize empty tensors for "to" and "from" positions
+    move_to_tensor = np.zeros((12, 8, 8), dtype=int)
+    move_from_tensor = np.zeros((12, 8, 8), dtype=int)
 
     # Get the piece that moved
     piece = board.piece_at(move.from_square)
@@ -93,45 +99,62 @@ def move_to_tensor(board, move):
         # Piece type: white pieces (0-5), black pieces (6-11)
         piece_idx = PIECE_MAP[piece.piece_type] if piece.color == chess.WHITE else PIECE_MAP[piece.piece_type + 6]
 
-        # Reset the starting square (from_square)
+        # Set the starting square ("from" position)
         from_row, from_col = divmod(move.from_square, 8)
-        move_tensor[piece_idx, from_row, from_col] = 0
+        move_from_tensor[piece_idx, from_row, from_col] = 1
 
-        # Set the target square (to_square)
+        # Set the target square ("to" position)
         to_row, to_col = divmod(move.to_square, 8)
-        # Mark the piece at the new position
-        move_tensor[piece_idx, to_row, to_col] = 1
+        move_to_tensor[piece_idx, to_row, to_col] = 1
 
-    return move_tensor
+    return move_to_tensor, move_from_tensor
 
 
-def available_moves_to_tensor(board):
-    available_moves_tensor = np.zeros((12, 8, 8), dtype=int)
+def available_moves_tensor(board):
+    # Create tensors to store available moves (to/from) for each piece
+    # One for each piece type (12)
+    available_moves_to = np.zeros((12, 8, 8))
+    available_moves_from = np.zeros(
+        (12, 8, 8))  # One for each piece type (12)
 
     for move in board.legal_moves:
-        piece = board.piece_at(move.from_square)
-        if piece:
-            # Set 1 where the move is legal for this piece type
-            piece_idx = PIECE_MAP[piece.piece_type] if piece.color == chess.WHITE else PIECE_MAP[piece.piece_type + 6]
-            row, col = divmod(move.to_square, 8)
-            available_moves_tensor[piece_idx, row, col] = 1
+        from_square = move.from_square
+        to_square = move.to_square
 
-    return available_moves_tensor
+        piece = board.piece_at(from_square)
+        piece_type = piece.piece_type - 1  # Convert to 0-indexed piece type
+
+        # Mark valid moves (to/from) for the piece
+        from_row = from_square // 8
+        from_col = from_square % 8
+        to_row = to_square // 8
+        to_col = to_square % 8
+
+        # Adjust for black pieces
+        if piece.color == chess.WHITE:
+            from_row = 7 - from_row
+            to_row = 7 - to_row
+
+        available_moves_from[piece_type, from_row, from_col] = 1
+        available_moves_to[piece_type, to_row, to_col] = 1
+
+        # if piece.color == chess.BLACK:
+        #     print(bitboard_to_tensor(board))
+
+        #     print(move)
+        #     print(from_row, from_col)
+        #     print(to_row, to_col)
+        #     print(available_moves_from[piece_type])
+        #     print(available_moves_to[piece_type])
+
+        #     exit(0)
+
+    return available_moves_to, available_moves_from
 
 
 def load_data_to_tensors(pgn_file, engine, max_games=None):
     data = []
     with open(DATABASE_DIR + '/' + pgn_file, 'r') as pgn_file:
-        # TODO: load only the games white wins
-        # make the bot good at playing winning white moves and only play white (maybe still do losing and draw games)
-        # for the best move, just put the next move made by white (maybe, check how fast stockfish is)
-
-        # for the available moves, just ignore dupes and put a 1 even if 3 pieces can move there (should be chessboard sized)
-        # just have the ouput be 64x64 and add more complexity as time goes on
-        # that should limit the output of illegal moves
-
-        # custom loss function to heavily penalize illegal moves
-
         count = 0
         while True:
             game = chess.pgn.read_game(pgn_file)
@@ -145,13 +168,17 @@ def load_data_to_tensors(pgn_file, engine, max_games=None):
             board = game.board()
             for i, move in enumerate(game.mainline_moves()):
                 if i % 2 == 0:
+
+                    # TODO: possibly encode in a better less massive way, such as a -1 for where its from and 1 for where its going to
                     position_tensor = bitboard_to_tensor(board)
 
-                    available_moves = available_moves_to_tensor(board)
+                    available_moves_to, available_moves_from = available_moves_tensor(
+                        board)
 
-                    next_move = move_to_tensor(board, move)
+                    next_move_to, next_move_from = move_to_tensor(board, move)
 
-                    data.append((position_tensor, available_moves, next_move))
+                    data.append((position_tensor, available_moves_to,
+                                available_moves_from, next_move_to, next_move_from))
                 board.push(move)
             count += 1
     return data
@@ -174,7 +201,7 @@ def get_best_move(board, engine):
     return encode_move(result.move, board)
 
 
-def train(model, dataloader, criterion, optimizer, epochs):
+def train(model, dataloader, criterion, optimizer, epochs, scheduler=None):
     print("Starting training")
     for epoch in range(epochs):
         model.train()  # Set model to training mode
@@ -183,87 +210,101 @@ def train(model, dataloader, criterion, optimizer, epochs):
         total_predictions = 0
 
         for batch in dataloader:
-            positions, available_moves, best_move = batch
-            positions, available_moves, best_move = (
-                positions.to(DEVICE).float(),
-                available_moves.to(DEVICE).float(),
-                best_move.to(DEVICE),
+            position_tensor, available_moves_to, available_moves_from, next_move_to, next_move_from = batch
+            position_tensor, available_moves_to, available_moves_from, next_move_to, next_move_from = (
+                position_tensor.to(DEVICE).float(),
+                available_moves_to.to(DEVICE).float(),
+                available_moves_from.to(DEVICE).float(),
+                next_move_to.to(DEVICE).float(),
+                next_move_from.to(DEVICE).float()
             )
 
             optimizer.zero_grad()
+
+            available_moves_mask = torch.cat(
+                (available_moves_to, available_moves_from), dim=1)
+
             # Get the model's predictions
-            logits = model(positions, available_moves)
+            logits_to, logits_from = model(
+                position_tensor, available_moves_mask)
 
-            # Flatten best_move to get the target index (best move index)
-            # We will use argmax across the channels to select the piece being moved
-            # The best_move has shape [batch_size, 12, 8, 8], we need to flatten it to indices.
-            best_move_flat = best_move.view(best_move.size(0), -1)
-            # Get the index of the active move (where the best move is non-zero)
-            best_move_index = torch.argmax(best_move_flat, dim=1)
-            # Ensure best_move_index is of type long, as expected by CrossEntropyLoss
-            best_move_index = best_move_index.long()
-
-            # Flatten logits to match the shape required for CrossEntropyLoss (batch_size, 12*8*8)
-            # Flatten logits to [batch_size, 12*8*8]
-            logits_flat = logits.view(logits.size(0), -1)
-
-            loss = criterion(logits_flat, best_move_index)
+            # Calculate the loss
+            loss = criterion(logits_to, logits_from,
+                             next_move_to, next_move_from)
 
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
 
-            predicted_flat = torch.argmax(
-                logits_flat, dim=1)  # Predicted indices (flat)
-            correct_predictions += (predicted_flat ==
-                                    best_move_index).sum().item()
-            total_predictions += best_move_index.size(0)
+            # Flatten logits for accuracy calculation
+            predicted_to = torch.argmax(
+                logits_to.view(logits_to.size(0), -1), dim=1)
+            predicted_from = torch.argmax(
+                logits_from.view(logits_from.size(0), -1), dim=1)
+
+            target_to_flat = next_move_to.view(next_move_to.size(0), -1)
+            target_from_flat = next_move_from.view(next_move_from.size(0), -1)
+
+            correct_predictions += (
+                (predicted_to == torch.argmax(target_to_flat, dim=1)).sum().item() +
+                (predicted_from == torch.argmax(
+                    target_from_flat, dim=1)).sum().item()
+            )
+            total_predictions += target_to_flat.size(0) + \
+                target_from_flat.size(0)
 
         avg_loss = running_loss / len(dataloader)
         accuracy = correct_predictions / total_predictions * 100
+
+        if scheduler is not None:
+            scheduler.step()
 
         print(
             f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
 
 def test(model, board, device):
-    # Convert the chess board to a tensor
+    # Convert the chess board to a tensor (with batch dimension)
     position_tensor = bitboard_to_tensor(board).unsqueeze(
         0).to(device)  # Add batch dimension and move to device
 
-    # Create the available moves tensor (12x8x8 encoding)
-    available_moves_tensor = torch.zeros(
-        (12, 8, 8), dtype=torch.float32).to(device)
-    for move in board.legal_moves:
-        from_square = move.from_square
-        to_square = move.to_square
-        # Convert piece to index (0-indexed)
-        piece_type = board.piece_at(from_square).piece_type - 1
+    # Create the available moves tensor ((12x8x8) encoding)
+    available_moves_to, available_moves_from = available_moves_tensor(board)
 
-        # Mark the available move in the corresponding channel (piece type) and position (from -> to)
-        available_moves_tensor[piece_type, to_square // 8, to_square % 8] = 1
+    available_moves_to, available_moves_from = torch.tensor(available_moves_to).to(
+        DEVICE).float(), torch.tensor(available_moves_from).to(DEVICE).float()
+
+    # unsqueeze to add the batch size dimension
+    available_moves_mask = torch.cat(
+        (available_moves_to, available_moves_from), dim=0).unsqueeze(0).to(device)
 
     # Pass the tensor through the model
     with torch.no_grad():  # No gradient tracking during inference
-        outputs = model(position_tensor.float(), available_moves_tensor)
+        logits_to, logits_from = model(
+            position_tensor.float(), available_moves_mask)
 
     # Flatten the output tensor and apply the available moves mask
-    outputs = outputs.view(-1)  # Flatten to a 1D tensor of shape (12*8*8,)
+    logits_to = logits_to.view(-1)  # Flatten to a 1D tensor of shape (12*8*8,)
+    # Flatten to a 1D tensor of shape (12*8*8,)
+    logits_from = logits_from.view(-1)
+
+    # print(logits_to)
+    # print(logits_from)
 
     # Apply the available moves mask: set the invalid moves to a very low value
-    # Flatten the available moves tensor
-    available_moves_mask = available_moves_tensor.view(-1)
-    # Mask the logits with the available moves
-    outputs = outputs * available_moves_mask
+    # Mask the "to" logits
+    logits_to = logits_to * available_moves_to.view(-1)
+    logits_from = logits_from * \
+        available_moves_from.view(-1)  # Mask the "from" logits
 
-    # Get the index of the highest predicted value (outputs are logits)
-    predicted_move_index = torch.argmax(outputs).item()
+    # Get the index of the highest predicted value for both "to" and "from"
+    predicted_move_index_to = torch.argmax(logits_to).item()
+    predicted_move_index_from = torch.argmax(logits_from).item()
 
     # Decode the predicted move index to (from_square, to_square)
-    # Row of the piece (which piece is moved)
-    from_square = predicted_move_index // 64
-    to_square = predicted_move_index % 64   # Column of the destination square
+    from_square = predicted_move_index_from // 64
+    to_square = predicted_move_index_to % 64  # Column of the destination square
 
     move = chess.Move(from_square, to_square)
 
@@ -278,12 +319,12 @@ def test(model, board, device):
 
 def retrieve_dataset(files, games_per_file=None):
     all_data = []
-    with chess.engine.SimpleEngine.popen_uci(ENGINE_PATH) as engine:
-        for file in files:
-            print(f"Processing {file}")
-            data = load_data_to_tensors(file, engine, games_per_file)
-            all_data.extend(data)
-        engine.quit()
+    # with chess.engine.SimpleEngine.popen_uci(ENGINE_PATH) as engine:
+    for file in files:
+        print(f"Processing {file}")
+        data = load_data_to_tensors(file, None, games_per_file)
+        all_data.extend(data)
+        # engine.quit()
 
     return ChessDataset(all_data)
 
@@ -302,11 +343,15 @@ def train_model(data_path, load=None, model_path=None, epochs=10):
         load_dataset(data_path), batch_size=32, shuffle=True)
     print("Dataset loaded")
     model = ChessCNN().to(device=DEVICE)
-    criterion = nn.CrossEntropyLoss()
+    # criterion = nn.CrossEntropyLoss()
+    # try tuning the hyperparamteres
+    criterion = CustomMoveLoss().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # Reduces learning rate by a factor of 10 every 10 epochs
+    scheduler = StepLR(optimizer, step_size=50, gamma=0.5)
 
     if load is None:
-        train(model, dataloader, criterion, optimizer, epochs)
+        train(model, dataloader, criterion, optimizer, epochs, scheduler)
 
     if model_path:
         torch.save(model.state_dict(), model_path)
@@ -322,16 +367,16 @@ def load_model(model_path):
 
 
 def main():
-    # if not os.path.isdir(DATABASE_DIR):
-    #     raise Exception(
-    #         'Lichess Elite Database directory not found. Please download the dataset from https://database.nikonoel.fr/ and extract it to the root directory of this project.')
-    # files = os.listdir(DATABASE_DIR)[1:]
+    if not os.path.isdir(DATABASE_DIR):
+        raise Exception(
+            'Lichess Elite Database directory not found. Please download the dataset from https://database.nikonoel.fr/ and extract it to the root directory of this project.')
+    files = os.listdir(DATABASE_DIR)[1:]
 
-    # dataset = retrieve_dataset(files, 100)
-    # save_dataset(dataset, 'chess_dataset.pth')
+    dataset = retrieve_dataset(files, 100)
+    save_dataset(dataset, '=.pth')
 
     model = train_model('chess_dataset.pth',
-                        model_path='chess_model.pth', epochs=5)
+                        model_path='chess_model.pth', epochs=500)
 
     # model = load_model('chess_model.pth')
 

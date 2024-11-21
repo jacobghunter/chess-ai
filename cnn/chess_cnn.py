@@ -15,8 +15,8 @@ class ChessCNN(nn.Module):
         # Fully connected layers after the convolutional layers
         self.fc1 = nn.Linear(256 * 8 * 8, 512)
 
-        # This will output the logits for each possible move
-        self.fc2 = nn.Linear(512, 12 * 8 * 8)
+        # 24 for both to and from move
+        self.fc2 = nn.Linear(512, 24 * 8 * 8)
 
     def forward(self, x, available_moves_mask):
         # Process the board state through the convolutional layers
@@ -30,12 +30,22 @@ class ChessCNN(nn.Module):
         # Pass through the first fully connected layer
         x = torch.relu(self.fc1(x))
 
+        # Generate logits for all possible "to" and "from" locations
         logits = self.fc2(x)
 
-        # unsure if this is necessary
-        logits = logits.view(-1, 12, 8, 8)
+        # Reshape logits to (batch_size, 24, 8, 8)
+        logits = logits.view(-1, 24, 8, 8)
 
-        # Available moves mask is also 12x8x8
-        masked_logits = logits * available_moves_mask
+        # Split the logits into "to" and "from" predictions
+        logits_to = logits[:, :12, :, :]
+        logits_from = logits[:, 12:, :, :]
 
-        return masked_logits
+        # Split the available moves mask into "to" and "from" masks
+        available_moves_to = available_moves_mask[:, :12, :, :]
+        available_moves_from = available_moves_mask[:, 12:, :, :]
+
+        # Apply the masks to enforce valid moves
+        masked_logits_to = logits_to * available_moves_to
+        masked_logits_from = logits_from * available_moves_from
+
+        return masked_logits_to, masked_logits_from
