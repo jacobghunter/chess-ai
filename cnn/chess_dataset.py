@@ -9,6 +9,6 @@ class ChessDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        position_tensor, available_moves_to, available_moves_from, next_move_to, next_move_from = self.data[
+        position_bitboard, legal_moves, target_from, target_to = self.data[
             idx]
-        return position_tensor, available_moves_to, available_moves_from, next_move_to, next_move_from
+        return position_bitboard, legal_moves, target_from, target_to
