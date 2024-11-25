@@ -35,10 +35,12 @@ def bitboard_to_board(board_tensor):
     return board
 
 
-def indicies_to_square(square):
-    if torch.is_tensor(square):
-        square = square.item()
-    return chess.square(square % 8, 8 - (square // 8))
+def tensor_square_to_chess_square(square):
+        if torch.is_tensor(square):
+            square = square.item()
+        row = 7 - square // 8
+        col = square % 8
+        return chess.square(col, row)
 
 
 def encode_piece_from_to(piece_type, from_square, to_square):
@@ -53,6 +55,16 @@ def decode_piece_from_to(target):
     to_square = target & 0x3F
 
     return piece_type, from_square, to_square
+
+def decode_piece_from_to_tensor(target):
+    if isinstance(target, list):
+        target = torch.tensor(target, dtype=torch.long)
+    
+    piece_type = (target >> 12) & 0xF
+    from_square = (target >> 6) & 0x3F
+    to_square = target & 0x3F
+    
+    return torch.stack((piece_type, from_square, to_square), dim=-1)
 
 
 def encode_target_from(piece_type, from_square):

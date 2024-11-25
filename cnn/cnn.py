@@ -11,7 +11,7 @@ from custom_collate_fn import custom_collate_fn
 from custom_loss import CustomMoveLoss
 from torch.optim.lr_scheduler import StepLR
 import os
-from utilities import board_to_bitboard, bitboard_to_board, decode_target_from, encode_piece_from_to, decode_piece_from_to, encode_target_from
+from utilities import board_to_bitboard, encode_piece_from_to, encode_target_from, tensor_square_to_chess_square
 from torch.amp import autocast, GradScaler
 
 PIECE_MAP = {
@@ -28,8 +28,6 @@ ENGINE_PATH = '../stockfish/stockfish-windows-x86-64-avx2.exe'
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-
-# EVERYTHING IS 12x8x8
 
 
 def encode_move(move, board):
@@ -192,7 +190,7 @@ def create_move_tensor(square, piece_type=None):
         return tensor
 
 
-def train(model, dataloader, criterion, optimizer, epochs, scheduler=None):
+def train(model, dataloader, criterion, optimizer, epochs, alpha, beta, scheduler=None, warmup_scheduler=None):
     print("Starting training")
     scaler = GradScaler()
     for epoch in range(epochs):
@@ -201,8 +199,10 @@ def train(model, dataloader, criterion, optimizer, epochs, scheduler=None):
         correct_predictions = 0
         total_predictions = 0
 
+        is_warming_up = True
+
         for i, (position_bitboards, legal_moves, target_froms, target_tos) in enumerate(dataloader):
-            print(f'Batch {i+1}/{len(dataloader)}')
+            # print(f'Batch {i+1}/{len(dataloader)}')
             position_bitboards = position_bitboards.to(DEVICE).float()
             legal_moves = legal_moves.to(DEVICE)
             target_froms = target_froms.to(DEVICE)
@@ -221,11 +221,13 @@ def train(model, dataloader, criterion, optimizer, epochs, scheduler=None):
                 # Compute losses
                 loss_piece = criterion(logits_pieces_flat, target_froms)
                 loss_move = criterion(logits_moves_flat, target_tos)
-                total_loss = loss_piece + loss_move
+                total_loss = alpha * loss_piece + beta * loss_move
 
             # Backpropagation
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
+            # unsure if neccesary
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
             scaler.update()
 
             running_loss += total_loss.item()
@@ -243,15 +245,22 @@ def train(model, dataloader, criterion, optimizer, epochs, scheduler=None):
         accuracy = correct_predictions / total_predictions * 100
 
         if scheduler is not None:
-            scheduler.step()
+            if is_warming_up and warmup_scheduler:
+                warmup_scheduler.step()
+                if warmup_scheduler.last_epoch == warmup_scheduler.total_iters:
+                    is_warming_up = False
+            else:
+                scheduler.step()
 
-        torch.save(model.state_dict(), f"model_epoch_{epoch}.pth")
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), f"model_epoch_{epoch}.pth")
 
-        print(
-            f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+        if epoch % 10 == 0:
+            print(
+                f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
 
-def test(model, board, device):
+def test(model, board):
     """
     Test the model's move prediction for a given chess board state.
 
@@ -283,41 +292,41 @@ def test(model, board, device):
     batch = [(position_bitboard, legal_moves, target_from, target_to)]
 
     # Use the custom collate function to prepare the batch
-    position_bitboards, padded_legal_moves, target_froms, target_tos = custom_collate_fn(
+    position_bitboards, padded_legal_moves, _, _ = custom_collate_fn(
         batch)
 
     # Move tensors to the appropriate device
-    position_bitboards = position_bitboards.to(device)
-    padded_legal_moves = padded_legal_moves.to(device)
+    position_bitboards = position_bitboards.to(DEVICE)
+    padded_legal_moves = padded_legal_moves.to(DEVICE)
 
     # Perform inference with the model
     with torch.no_grad():  # No gradient tracking during inference
         logits_piece, logits_move = model(
-            position_bitboards.float(), padded_legal_moves)
+            position_bitboards.float(), padded_legal_moves, inference=True)
+        
+    piece_logits = logits_piece[0]  # Remove batch dimension
+    selected_piece_index = torch.argmax(piece_logits).item()
+    selected_piece_plane = selected_piece_index // (8 * 8)
+    selected_piece_square = selected_piece_index % (8 * 8)
 
-    # Decode predicted piece and move indices
-    predicted_piece_index = torch.argmax(logits_piece[0]).item()
-    predicted_move_index = torch.argmax(logits_move[0]).item()
+    from_square = selected_piece_square 
+    # convert to chessboard indicies
+    from_square = tensor_square_to_chess_square(from_square)
 
-    # Ensure the predicted move index is valid
-    predicted_legal_move = padded_legal_moves[0, predicted_move_index].item()
+    move_logits = logits_move[0]  # Remove batch dimension
+    target_square = torch.argmax(move_logits).item()
+    target_square = tensor_square_to_chess_square(target_square)
 
-    if predicted_legal_move != 0:  # Ignore padded zero entries
-        # Decode the legal move using its encoded format
-        piece_type, from_square, to_square = decode_piece_from_to(
-            predicted_legal_move)
-
-        # Create the move object
-        move = chess.Move(from_square, to_square)
-
-        # Check if the move is legal
+    # Validate the predicted move
+    if selected_piece_plane >= 0 and target_square >= 0:
+        move = chess.Move(from_square, target_square)
         if move in board.legal_moves:
             print(f"Predicted move: {board.san(move)}")
             return move
         else:
             print(f"Invalid move: {move}")
     else:
-        print("Predicted move corresponds to a padded entry (invalid).")
+        print("No valid move predicted.")
 
     return None
 
@@ -344,25 +353,28 @@ def load_dataset(file_path):
 
 
 def train_model(data_path, load=None, model_path=None, epochs=10):
+    # TODO: tune parameters further (check bottom for data)
     dataloader = DataLoader(
         load_dataset(data_path),
-        batch_size=12288,  # this could def be too big but it seems to be going strong for now
+        # batch_size=12288,  # this could def be too big but it seems to be going strong for now
+        batch_size=4096,
         shuffle=True,
-        num_workers=0,
+        num_workers=8,
         collate_fn=custom_collate_fn,
         pin_memory=True
     )
     print("Dataset loaded")
-    model = ChessCNN().to(device=DEVICE)
-    # try tuning the hyperparamteres
-    # criterion = CustomMoveLoss().to(DEVICE)
+    model = ChessCNN(dropout_prob=0.3).to(device=DEVICE)
+    # this could be an issue
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # try adam vs adamw
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.001)
     # Reduces learning rate by a factor of 1/2 every 10 epochs
-    scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=20)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-5)
 
     if load is None:
-        train(model, dataloader, criterion, optimizer, epochs, None)
+        train(model, dataloader, criterion, optimizer, epochs, alpha=0.5, beta=0.5, scheduler=scheduler, warmup_scheduler=warmup_scheduler)
 
     if model_path:
         torch.save(model.state_dict(), model_path)
@@ -376,36 +388,85 @@ def load_model(model_path):
     model.load_state_dict(torch.load(model_path))
     return model
 
+def play(model):
+    board = chess.Board()
+    print(board)
+    while not board.is_game_over():
+        if board.turn == chess.WHITE:
+            move = test(model, board)
+            if move:
+                board.push(move)
+            else:
+                exit()
+            print(board)
+        else:
+            move = input("Enter move: ")
+            move = chess.Move.from_uci(move)
+            if move:
+                board.push(move)
+            print(board)
 
 def main():
+    # TODO: compile better training data
     # if not os.path.isdir(DATABASE_DIR):
     #     raise Exception(
     #         'Lichess Elite Database directory not found. Please download the dataset from https://database.nikonoel.fr/ and extract it to the root directory of this project.')
-    # files = os.listdir(DATABASE_DIR)[30:]
+    # files = os.listdir(DATABASE_DIR)[1:]
 
-    # dataset = retrieve_dataset(files, 50)
+    # dataset = retrieve_dataset(files, 200)
     # save_dataset(dataset, 'chess_dataset.pth')
 
-    model = train_model('chess_dataset.pth',
-                        model_path='chess_model.pth', epochs=10)
+    # model = train_model('chess_dataset.pth',
+    #                     model_path='chess_model.pth', epochs=500)
 
-    # model = load_model('chess_model.pth')
+    model = load_model('model_epoch_25.pth')
 
     # mate in 1 correct is e2h5
-    b = chess.Board("r2qkbnr/1b5p/p1n2p2/1pN1pNp1/1P1p4/1Q4P1/PBPPBP1P/R3K2R")
+    m1 = chess.Board("r2qkbnr/1b5p/p1n2p2/1pN1pNp1/1P1p4/1Q4P1/PBPPBP1P/R3K2R")
 
-    print(b)
+    # m1 = chess.Board("3r4/1K6/2Nb4/2kb4/8/8/3PB3/8 w - - 0 1")
 
     # mate in 3, correct is g1g7
-    # b = chess.Board("r3k3/1p1p1ppp/1p1B4/1p6/Pp6/P3P3/8/4K1QR")
+    m3 = chess.Board("r3k3/1p1p1ppp/1p1B4/1p6/Pp6/P3P3/8/4K1QR")
 
     # print(engine.play(b, chess.engine.Limit(time=0.0001)).move)
 
     # engine.quit()
 
-    move = test(model, b, DEVICE)
-    print(move)
+    # print(m1)
+    # print(test(model, m1))
+    # TODO: FIX TEST FUNCTION
+    # print(m3)
+    # print(test(model, m3))
 
+    # start = chess.Board()
+    # print(start)
+    # print(test(model, start))
+
+    # play(model)
 
 if __name__ == "__main__":
     main()
+
+
+# Epoch [1/200], Loss: 4.6521, Accuracy: 3.88%
+# Epoch [10/200], Loss: 2.6873, Accuracy: 27.94%
+# Epoch [20/200], Loss: 2.4956, Accuracy: 31.41%
+# Epoch [30/200], Loss: 2.4321, Accuracy: 32.63%
+# Epoch [40/200], Loss: 2.4042, Accuracy: 33.19%
+# Epoch [50/200], Loss: 2.3896, Accuracy: 33.47%
+# Epoch [60/200], Loss: 2.3841, Accuracy: 33.58%
+# Epoch [70/200], Loss: 2.3782, Accuracy: 33.65%
+# Epoch [80/200], Loss: 2.3760, Accuracy: 33.68%
+# Epoch [90/200], Loss: 2.3769, Accuracy: 33.67%
+# Epoch [100/200], Loss: 2.3760, Accuracy: 33.72%
+# Epoch [110/200], Loss: 2.3760, Accuracy: 33.71%
+# Epoch [120/200], Loss: 2.3759, Accuracy: 33.72%
+# Epoch [130/200], Loss: 2.3761, Accuracy: 33.68%
+# Epoch [140/200], Loss: 2.3767, Accuracy: 33.64%
+# Epoch [150/200], Loss: 2.3752, Accuracy: 33.71%
+# Epoch [160/200], Loss: 2.3759, Accuracy: 33.71%
+# Epoch [170/200], Loss: 2.3771, Accuracy: 33.68%
+# Epoch [180/200], Loss: 2.3760, Accuracy: 33.68%
+# Epoch [190/200], Loss: 2.3756, Accuracy: 33.72%
+# Epoch [200/200], Loss: 2.3760, Accuracy: 33.72%
