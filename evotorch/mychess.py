@@ -13,7 +13,6 @@ from abstract_game import AbstractGame
 import chess
 import chess.engine
 import chess.pgn
-
 class MuZeroConfig:
     def __init__(self):
         # fmt: off
@@ -25,7 +24,7 @@ class MuZeroConfig:
 
 
         ### Game
-        self.observation_shape = (3, 6, 7)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
+        self.observation_shape = (12, 8, 8)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
         self.action_space = list(range(4096))  # Fixed list of all possible actions. You should only edit the length
         self.players = list(range(2))  # List of players. You should only edit the length
         self.stacked_observations = 0  # Number of previous observations and previous actions to add to the current observation
@@ -135,7 +134,7 @@ def from_actionspace(action_space_move: int):
     return chess.Move(action_space_move%64,action_space_move//64)
 
 
-class EvoChess(AbstractGame):
+class Game(AbstractGame):
     def __init__(self, seed=None):
         self.board : chess.Board = chess.Board()
         self.player = 1
@@ -150,19 +149,16 @@ class EvoChess(AbstractGame):
         Returns:
             The new observation, the reward and a boolean if the game has ended.
         """
-        for i in range(6):
-            if self.board[i][action] == 0:
-                self.board[i][action] = self.player
-                break
 
         next_move : chess.Move = from_actionspace(action)
 
         if not self.board.is_legal(next_move):
            next_move = chess.Move(next_move.from_square,next_move.to_square,promotion=chess.QUEEN)
         if not self.board.is_legal(next_move):
-            next_move = self.board.generate_legal_moves().__next__
+            next_move = self.board.generate_legal_moves().__next__()
             print("AUTO MOVE")
         
+        print(next_move)
         self.board.push(next_move)
 
         done = self.board.is_checkmate() or self.board.can_claim_draw() or len(self.legal_actions()) == 0
@@ -196,7 +192,7 @@ class EvoChess(AbstractGame):
         moves = []
         for move in self.board.generate_legal_moves():
             moves.append(to_actionspace(move))
-        return 
+        return moves
 
     def reset(self):
         """
@@ -208,6 +204,34 @@ class EvoChess(AbstractGame):
         self.board : chess.Board = chess.Board()
         self.player = 1
         return self.get_observation()
+    
+    def get_observation(self):
+        pawn_white = numpy.array(self.board.pieces(chess.PAWN,chess.WHITE).tolist()).reshape(8,8)
+        rook_white = numpy.array(self.board.pieces(chess.ROOK,chess.WHITE).tolist()).reshape(8,8)
+        knight_white = numpy.array(self.board.pieces(chess.KNIGHT,chess.WHITE).tolist()).reshape(8,8)
+        bisop_white = numpy.array(self.board.pieces(chess.BISHOP,chess.WHITE).tolist()).reshape(8,8)
+        queen_white = numpy.array(self.board.pieces(chess.QUEEN,chess.WHITE).tolist()).reshape(8,8)
+        king_white = numpy.array(self.board.pieces(chess.KING,chess.WHITE).tolist()).reshape(8,8)
+
+        pawn_black = numpy.array(self.board.pieces(chess.PAWN,chess.BLACK).tolist()).reshape(8,8)
+        rook_black = numpy.array(self.board.pieces(chess.ROOK,chess.BLACK).tolist()).reshape(8,8)
+        knight_black = numpy.array(self.board.pieces(chess.KNIGHT,chess.BLACK).tolist()).reshape(8,8)
+        bisop_black = numpy.array(self.board.pieces(chess.BISHOP,chess.BLACK).tolist()).reshape(8,8)
+        queen_black = numpy.array(self.board.pieces(chess.QUEEN,chess.BLACK).tolist()).reshape(8,8)
+        king_black = numpy.array(self.board.pieces(chess.KING,chess.BLACK).tolist()).reshape(8,8)
+        return numpy.array(
+            [pawn_white, 
+             rook_white, 
+             knight_white, 
+             bisop_white,
+             queen_white,
+             king_white,
+             pawn_black, 
+             rook_black, 
+             knight_black, 
+             bisop_black,
+             queen_black,
+             king_black])
 
     async def render(self):
         """
@@ -258,103 +282,3 @@ class EvoChess(AbstractGame):
             String representing the action.
         """
         return from_actionspace(action_number).__str__()
-
-
-class Chess:
-    def get_observation(self):
-        board_player1 = numpy.where(self.board == 1, 1.0, 0.0)
-        board_player2 = numpy.where(self.board == -1, 1.0, 0.0)
-        board_to_play = numpy.full((6, 7), self.player, dtype="int32")
-        return numpy.array([board_player1, board_player2, board_to_play])
-
-    def legal_actions(self):
-        legal = []
-        for i in range(7):
-            if self.board[5][i] == 0:
-                legal.append(i)
-        return legal
-
-    def have_winner(self):
-        # Horizontal check
-        for i in range(4):
-            for j in range(6):
-                if (
-                    self.board[j][i] == self.player
-                    and self.board[j][i + 1] == self.player
-                    and self.board[j][i + 2] == self.player
-                    and self.board[j][i + 3] == self.player
-                ):
-                    return True
-
-        # Vertical check
-        for i in range(7):
-            for j in range(3):
-                if (
-                    self.board[j][i] == self.player
-                    and self.board[j + 1][i] == self.player
-                    and self.board[j + 2][i] == self.player
-                    and self.board[j + 3][i] == self.player
-                ):
-                    return True
-
-        # Positive diagonal check
-        for i in range(4):
-            for j in range(3):
-                if (
-                    self.board[j][i] == self.player
-                    and self.board[j + 1][i + 1] == self.player
-                    and self.board[j + 2][i + 2] == self.player
-                    and self.board[j + 3][i + 3] == self.player
-                ):
-                    return True
-
-        # Negative diagonal check
-        for i in range(4):
-            for j in range(3, 6):
-                if (
-                    self.board[j][i] == self.player
-                    and self.board[j - 1][i + 1] == self.player
-                    and self.board[j - 2][i + 2] == self.player
-                    and self.board[j - 3][i + 3] == self.player
-                ):
-                    return True
-
-        return False
-
-    def expert_action(self):
-        board = self.board
-        action = numpy.random.choice(self.legal_actions())
-        for k in range(3):
-            for l in range(4):
-                sub_board = board[k : k + 4, l : l + 4]
-                # Horizontal and vertical checks
-                for i in range(4):
-                    if abs(sum(sub_board[i, :])) == 3:
-                        ind = numpy.where(sub_board[i, :] == 0)[0][0]
-                        if numpy.count_nonzero(board[:, ind + l]) == i + k:
-                            action = ind + l
-                            if self.player * sum(sub_board[i, :]) > 0:
-                                return action
-
-                    if abs(sum(sub_board[:, i])) == 3:
-                        action = i + l
-                        if self.player * sum(sub_board[:, i]) > 0:
-                            return action
-                # Diagonal checks
-                diag = sub_board.diagonal()
-                anti_diag = numpy.fliplr(sub_board).diagonal()
-                if abs(sum(diag)) == 3:
-                    ind = numpy.where(diag == 0)[0][0]
-                    if numpy.count_nonzero(board[:, ind + l]) == ind + k:
-                        action = ind + l
-                        if self.player * sum(diag) > 0:
-                            return action
-
-                if abs(sum(anti_diag)) == 3:
-                    ind = numpy.where(anti_diag == 0)[0][0]
-                    if numpy.count_nonzero(board[:, 3 - ind + l]) == ind + k:
-                        action = 3 - ind + l
-                        if self.player * sum(anti_diag) > 0:
-                            return action
-
-        return action
