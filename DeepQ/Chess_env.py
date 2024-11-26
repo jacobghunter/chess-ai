@@ -283,6 +283,8 @@ class ChessEnvironment:
 
       new_state = self._get_state()
       reward = self._calculate_reward()
+      reward = np.clip(reward, -1, 1)  # Scale extreme rewards
+
       done = self.board.is_game_over()
 
       # Additional draw conditions
