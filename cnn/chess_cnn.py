@@ -3,7 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utilities import decode_piece_from_to, decode_piece_from_to_tensor, tensor_square_to_chess_square
+import time
+
+from utilities import bitboard_to_board
 
 class SimpleResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):
@@ -13,8 +15,14 @@ class SimpleResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
+        # If the input and output channels do not match, use a 1x1 convolution to match the dimensions
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        else:
+            self.shortcut = nn.Identity()  # If the channels are already equal, identity shortcut
+
     def forward(self, x):
-        identity = x
+        identity = self.shortcut(x)  # Apply the shortcut transformation (1x1 convolution if necessary)
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         return F.relu(out + identity)
@@ -34,6 +42,12 @@ class ChessCNN(nn.Module):
         self.resblock1 = SimpleResidualBlock(512, 512, 3)
         self.resblock2 = SimpleResidualBlock(512, 512, 3)
         self.resblock3 = SimpleResidualBlock(512, 512, 3)
+        self.resblock4 = SimpleResidualBlock(512, 512, 3)
+        self.resblock5 = SimpleResidualBlock(512, 512, 3)
+        self.resblock6 = SimpleResidualBlock(512, 512, 3)
+        self.resblock7 = SimpleResidualBlock(512, 512, 3)
+        self.resblock8 = SimpleResidualBlock(512, 512, 3)
+        self.resblock9 = SimpleResidualBlock(512, 512, 3)
 
         # Fully connected layers
         self.fc1 = nn.Linear(512 * 8 * 8, 1024)
@@ -44,19 +58,21 @@ class ChessCNN(nn.Module):
         self.fc_piece = nn.Linear(512, 12 * 8 * 8)  # Piece selection logits
         self.fc_move = nn.Linear(512, 8 * 8)  # Move selection logits
 
-        # nn.init.xavier_uniform_(self.fc1.weight)
-        # nn.init.xavier_uniform_(self.fc_piece.weight)
-        # nn.init.xavier_uniform_(self.fc_move.weight)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc_piece.weight)
+        nn.init.xavier_uniform_(self.fc_move.weight)
 
-    def forward(self, bitboard, legal_moves, inference=False):
+    def forward(self, bitboards, flat_valid_pieces_masks, legal_moves, current_epoch=1, total_epochs=2, inference=False):
         # Convolutional layers
-        x = F.relu(self.bn1(self.conv1(bitboard)))
+        x = F.relu(self.bn1(self.conv1(bitboards)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
 
         x = self.resblock1(x)
         x = self.resblock2(x)
         x = self.resblock3(x)
+        x = self.resblock4(x)
+        x = self.resblock5(x)
 
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
@@ -64,112 +80,92 @@ class ChessCNN(nn.Module):
         x = self.dropout_fc(x)
 
         # Outputs for piece and move selection
-        logits_piece = self.fc_piece(x).view(-1, 12, 8, 8)
-        logits_move = self.fc_move(x).view(-1, 8, 8)
+        fc_piece = self.fc_piece(x)
+        fc_move = self.fc_move(x)
+
+        max_invalid_penalty = -1e1
+        min_invalid_penalty = -1e0
+        scaling_factor = max(0.1, 1 - current_epoch / total_epochs)
+        dynamic_penalty = max_invalid_penalty * scaling_factor + min_invalid_penalty * (1 - scaling_factor)
 
         if inference:
-            legal_moves = decode_piece_from_to_tensor(legal_moves).to(x.device)
+            piece_softmax = torch.where(flat_valid_pieces_masks.bool(), fc_piece, float('-inf'))
+            piece_softmax = F.softmax(piece_softmax, dim=1)
+            from_square = torch.argmax(piece_softmax.view(-1, 12, 8 * 8).sum(dim=1).flatten(1), dim=1)  # Get the best move (from square)
 
-            # Normalized to ensure it chooses a real piece
-            norm_logits_piece = torch.softmax(logits_piece.view(-1), dim=0).view(logits_piece.shape)
-
-            # Mask logits to ensure only valid pieces are considered
-            valid_pieces_mask = self.generate_valid_pieces_mask(legal_moves).to(x.device)
-            # print("Valid pieces mask:", valid_pieces_mask)
-            # print("Any NaN or inf values in valid_pieces_mask:", torch.any(torch.isnan(valid_pieces_mask)), torch.any(torch.isinf(valid_pieces_mask)))
-
-            norm_logits_piece = norm_logits_piece * valid_pieces_mask
-
-            logits_flat = norm_logits_piece.view(-1, 12 * 8 * 8)
-            logits_summed = logits_flat.view(-1, 12, 8, 8).sum(dim=1)
-            from_square = torch.argmax(logits_summed.view(-1, 8 * 8), dim=1)
-
-            # Mask logits_move to ensure only valid moves are considered
             valid_moves_mask = self.generate_valid_moves_mask(from_square, legal_moves).to(x.device)
-            norm_logits_move = torch.softmax(logits_move.view(-1), dim=0).view(logits_move.shape)
-            norm_logits_move = norm_logits_move * valid_moves_mask
+            move_softmax = torch.where(valid_moves_mask.bool(), fc_move, float('-inf'))
+            move_softmax = F.softmax(move_softmax, dim=1)
+            to_square = torch.argmax(move_softmax, dim=1)
 
-            return norm_logits_piece, norm_logits_move
+            return from_square, to_square
         else:
-            return logits_piece, logits_move
+            piece_softmax = torch.where(flat_valid_pieces_masks.bool(), fc_piece, float('-inf'))
+            piece_softmax = F.softmax(piece_softmax, dim=1)
+            from_square = torch.argmax(piece_softmax.view(-1, 12, 8 * 8).sum(dim=1).flatten(1), dim=1)  # Get the best move (from square)
 
-    def generate_valid_pieces_mask(self, legal_moves):
-        # Initialize an empty mask with shape [batch_size, 12, 8, 8]
-        batch_size = len(legal_moves)
-        valid_pieces_mask = torch.zeros(
-            batch_size, 12, 8, 8, device=legal_moves[0][0].device)
+            fc_piece = torch.where(flat_valid_pieces_masks.bool(), fc_piece, dynamic_penalty)
+            
+            # Generate and apply valid moves mask
+            valid_moves_mask = self.generate_valid_moves_mask(from_square, legal_moves).to(x.device)
+            fc_move = torch.where(valid_moves_mask.bool(), fc_move, dynamic_penalty)
 
-        # Create a tensor of piece types and from_square indices
-        # Flatten the legal_moves for batch processing
-        all_piece_types, all_from_squares, batch_indices = [], [], []
-        for i, sample_moves in enumerate(legal_moves):
-            piece_types, from_squares = zip(
-                *[(pt, fs) for pt, fs, _ in sample_moves if pt > 0]
-            )
+            del from_square 
+            del valid_moves_mask
+            del piece_softmax
 
-            # Append to the overall list of piece types and from squares
-            all_piece_types.extend(piece_types)
-            all_from_squares.extend(from_squares)
+            return fc_piece, fc_move
 
-            # Also track the batch index for each move
-            batch_indices.extend([i] * len(piece_types))
-
-        # Create tensors from the lists of piece types and from squares
-        all_piece_types = torch.tensor(
-            all_piece_types, dtype=torch.long, device=valid_pieces_mask.device)
-        all_from_squares = torch.tensor(
-            all_from_squares, dtype=torch.long, device=valid_pieces_mask.device)
-        batch_indices = torch.tensor(
-            batch_indices, dtype=torch.long, device=valid_pieces_mask.device)
-
-        # Convert from_square to row, col using integer division and modulo
-        from_rows = 7 - (all_from_squares // 8)  # Integer division for row
-        from_cols = all_from_squares % 8       # Modulo for column
-
-        # Map the piece types to valid indices in the valid_pieces_mask
-        # Adjust piece type to match mask index (0-11)
-        piece_indices = all_piece_types - 1
-
-        # Use advanced indexing to fill in the valid_pieces_mask with the appropriate values
-
-        valid_pieces_mask[batch_indices,
-                          piece_indices, from_rows, from_cols] = 1
-                
-        return valid_pieces_mask
 
     def generate_valid_moves_mask(self, piece_square, legal_moves):
-        batch_size = len(legal_moves)
-        valid_moves_mask = torch.zeros(
-            batch_size, 8, 8, device=legal_moves[0][0].device)
+        """
+        Generate a mask for valid moves from a given piece square in a batch.
+        
+        Parameters:
+            piece_square (torch.Tensor): Tensor of shape [batch_size] containing the square of the selected piece (0-63).
+            legal_moves (torch.Tensor): Tensor of shape [batch_size, max_legal_moves, 3], 
+                                        where each entry is (piece_type, from_square, to_square), padded with -1.
+                                        
+        Returns:
+            torch.Tensor: Tensor of shape [batch_size, 8 * 8] with 1s for valid moves and 0s elsewhere.
+        """
+        batch_size = piece_square.size(0)
+        max_legal_moves = legal_moves.size(1)
+        
+        # Create an empty mask of shape [batch_size, 8 * 8]
+        valid_moves_mask = torch.zeros((batch_size, 8 * 8), device=legal_moves.device, dtype=torch.int)
 
-        chess_squares = [tensor_square_to_chess_square(
-            square) for square in piece_square]
+        # Reshape the legal_moves tensor for easier indexing
+        legal_moves_flat = legal_moves.view(batch_size * max_legal_moves, 3)
 
-        # Iterate over all legal moves for the board
-        all_to_squares = []
-        batch_indices = []
-        for i, moves in enumerate(legal_moves):
-            to_squares = [ts for _, fs, ts in moves if fs == chess_squares[i]]
+        # Extract from squares and to squares
+        from_squares = legal_moves_flat[:, 1]
+        to_squares = legal_moves_flat[:, 2]
 
-            # Unpack "from" and "to" squares, if any moves are valid
-            if to_squares:
-                all_to_squares.extend(to_squares)
-                batch_indices.extend([i] * len(to_squares))
+        # Create a mask for valid legal moves (exclude padded entries with -1)
+        valid_mask = (from_squares != -1)
 
-        if all_to_squares:
-            # Convert to tensors
-            all_to_squares = torch.tensor(
-                all_to_squares, dtype=torch.long, device=valid_moves_mask.device
-            )
-            batch_indices = torch.tensor(
-                batch_indices, dtype=torch.long, device=valid_moves_mask.device
-            )
+        # Filter moves where the from_square matches the piece_square
+        batch_indices = torch.arange(batch_size, device=legal_moves.device).repeat_interleave(max_legal_moves)
+        match_mask = (from_squares == piece_square[batch_indices]) & valid_mask
 
-            # Calculate row and column indices for the "to" squares
-            to_rows = 7 - (all_to_squares // 8)
-            to_cols = all_to_squares % 8
+        # Filter valid moves and their respective batch indices
+        valid_batch_indices = batch_indices[match_mask]
+        valid_to_squares = to_squares[match_mask]
 
-            # Use advanced indexing to mark valid moves in the mask
-            valid_moves_mask[batch_indices, to_rows, to_cols] = 1
+        # Compute indices for the 8 * 8 mask (to_squares map directly to the 8 * 8 board)
+        move_indices = valid_to_squares  # Direct mapping to 8 * 8 board
+
+        # Set the valid moves in the mask
+        valid_moves_mask[valid_batch_indices, move_indices] = 1
+
+        del legal_moves_flat
+        del from_squares
+        del to_squares
+        del valid_mask
+        del batch_indices
+        del match_mask
+        del valid_batch_indices
+        del valid_to_squares
 
         return valid_moves_mask

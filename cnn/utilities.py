@@ -14,7 +14,7 @@ def board_to_bitboard(board):
             for pos in piece_positions:
                 row, col = divmod(pos, 8)
                 board_tensor[(color == chess.BLACK) * 6 +
-                             piece_type - 1, 7 - row, col] = 1
+                             piece_type - 1, row, col] = 1
 
     return torch.tensor(board_tensor)
 
@@ -27,7 +27,7 @@ def bitboard_to_board(board_tensor):
             for row in range(8):
                 for col in range(8):
                     if board_tensor[(color == chess.BLACK) * 6 +
-                                    piece_type - 1, 7 - row, col] == 1:
+                                    piece_type - 1, row, col] == 1:
                         square = chess.square(col, row)
                         piece = chess.Piece(piece_type, color)
                         board.set_piece_at(square, piece)
@@ -56,6 +56,7 @@ def decode_piece_from_to(target):
 
     return piece_type, from_square, to_square
 
+
 def decode_piece_from_to_tensor(target):
     if isinstance(target, list):
         target = torch.tensor(target, dtype=torch.long)
@@ -69,7 +70,6 @@ def decode_piece_from_to_tensor(target):
 
 def encode_target_from(piece_type, from_square):
     # Leave Piece as 1-12
-
     encoded_value = (piece_type << 6) | from_square
     return encoded_value
 
@@ -119,3 +119,11 @@ def print_tensor_board(board_tensor):
     print("-" * 17)
 
     return chess_board
+
+
+def swap_chess_array_square(square):
+    if torch.is_tensor(square):
+        square = square.item()
+    row, col = divmod(square, 8)
+    row = 7 - row
+    return row * 8 + col
