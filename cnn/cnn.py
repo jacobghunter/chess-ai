@@ -131,7 +131,83 @@ def available_moves_tensor(board):
     return available_moves_to, available_moves_from
 
 
-def load_data_to_tensors(pgn_file, engine, max_games=None):
+def load_data_with_engine(pgn_file, move_number=5, mate_score=5000, max_games=None):
+    # mate score is equivalent to 50 pawns, basically if theres a mate in X the bot should play it
+
+    engine = chess.engine.SimpleEngine.popen_uci("../stockfish/src/stockfish")
+    limit = chess.engine.Limit(depth=10)
+    engine.configure({
+        "Skill Level": 20,
+    })
+
+    data = []
+    with open(DATABASE_DIR + '/' + pgn_file, 'r') as pgn_file:
+        count = 0
+        while True:
+            game = chess.pgn.read_game(pgn_file)
+
+            if game is None or (max_games and count >= max_games):
+                break
+
+            if game.headers['Result'] != '1-0':
+                continue
+
+            board = game.board()
+            for i, move in enumerate(game.mainline_moves()):
+                # maybe use black moves and label it with a 13x8x8 tensor in the future
+                # i could also just get the valid_pieces_mask and see if there are white or black pieces there instead of explicitly saying it here
+                if i % 2 == 0:
+                    position_bitboard = board_to_bitboard(board)
+
+                    valid_pieces_mask = torch.zeros(12 * 8 * 8)
+                    # Format: [type, from square, to square]
+                    legal_moves = torch.zeros(len(list(board.legal_moves)), 3)
+
+                    for i, legal_move in enumerate(list(board.legal_moves)):
+                        piece_type, from_square, to_square  = board.piece_at(legal_move.from_square).piece_type, legal_move.from_square, legal_move.to_square
+                        piece_type = piece_type - 1
+                        legal_moves[i] = torch.tensor((piece_type, from_square, to_square))
+
+                        valid_pieces_mask[(piece_type) * 64 + from_square] = 1
+                        
+
+                    # best X possible moves (filled with -1s if there are less than X moves)
+                    best_moves = torch.full((move_number, 3), -1)
+                    an = engine.analyse(board, limit, multipv=move_number)
+
+                    for i, moves in enumerate(an):
+                        # 0 is the first move in the line and score is the score of the move in centipawns
+                        # scale here if I dont need this data later, otherwise use the loss function
+                        engine_move = moves['pv'][0]
+                        score = moves['score'].relative
+
+                        if score.is_mate():
+                            # returns moves to mate
+                            score = score.mate()
+
+                            # scaling score based on how many moves to mate
+                            # this means a m5 will be 4500CP, and a m1 will be 5000CP, which seems reasonable
+                            score = mate_score + -score * 100
+
+                        # putting in 12*8*8 form
+                        engine_target_from = encode_target_from(
+                            board.piece_at(engine_move.from_square).piece_type - 1, engine_move.from_square)
+                        
+                        best_moves[i] = torch.tensor((engine_target_from, engine_move.to_square, ))
+
+                    # ( bitboard, valid pieces mask , legal moves:  (piece_type   , from_square   , to_square    ), best moves: [ (target_from    , target_to     ) ] )
+                    # ( 12x8x8  , 12*8*8 mask       ,               (int from 0-11, int from 0-63 , int from 0-63),             [ (int from 0-12*8, int from 0-63 ) ] )
+                    data.append(
+                        (position_bitboard, valid_pieces_mask, legal_moves, best_moves))
+
+                board.push(move)
+            count += 1
+            
+    engine.quit()
+    return data
+
+
+def load_data_to_tensors(pgn_file, max_games=None):
     data = []
     with open(DATABASE_DIR + '/' + pgn_file, 'r') as pgn_file:
         count = 0
@@ -398,7 +474,7 @@ def retrieve_dataset(files, games_per_file=None):
     # with chess.engine.SimpleEngine.popen_uci(ENGINE_PATH) as engine:
     for file in files:
         print(f"Processing {file}")
-        data = load_data_to_tensors(file, None, games_per_file)
+        data = load_data_to_tensors(file, games_per_file)
         all_data.extend(data)
         # engine.quit()
 
@@ -508,7 +584,6 @@ def main():
     # this also means itll prioritize choosing the right piece fist and then the right move (with the loss scaling i have currently)
 
 
-
     # if not os.path.isdir(DATABASE_DIR):
     #     raise Exception(
     #         'Lichess Elite Database directory not found. Please download the dataset from https://database.nikonoel.fr/ and extract it to the root directory of this project.')
@@ -522,7 +597,7 @@ def main():
     # model = train_model(file,
     #                     model_path='chess_model.pth', epochs=30)
 
-    model = load_model('chess_model_20.pth')
+    # model = load_model('chess_model_20.pth')
 
     # mate in 1 correct is e2h5
     m1 = chess.Board("r2qkbnr/1b5p/p1n2p2/1pN1pNp1/1P1p4/1Q4P1/PBPPBP1P/R3K2R")
@@ -545,7 +620,7 @@ def main():
     # print(start)
     # print(test(model, start))
 
-    play(model)
+    # play(model)
 
 if __name__ == "__main__":
     main()

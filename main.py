@@ -3,7 +3,6 @@ import chess.svg
 import chess.engine
 import time
 import os
-from stockfish import Stockfish
 
 
 def display():
@@ -44,11 +43,11 @@ def stockfish():
     # )
 
     engine1 = chess.engine.SimpleEngine.popen_uci(
-        "stockfish/stockfish-windows-x86-64-avx2.exe")
+        "stockfish/src/stockfish")
     engine2 = chess.engine.SimpleEngine.popen_uci(
-        "stockfish/stockfish-windows-x86-64-avx2.exe")
+        "stockfish/src/stockfish")
 
-    engine1.configure({
+    engine2.configure({
         "Skill Level": 0,  # Skill Level (from 0 to 20)
     })
 
@@ -56,9 +55,25 @@ def stockfish():
         "Skill Level": 20,
     })
 
-    board = chess.Board()
+    # board = chess.Board()
+    board = chess.Board("r2qkbnr/1b5p/p1n2p2/1pN1pNp1/1P1p4/1Q4P1/PBPPBP1P/R3K2R")
 
     limit = chess.engine.Limit(depth=10)
+
+    # board.push_uci("b3e6")
+
+    an = engine1.analyse(board, limit, multipv=5)
+    print(board)
+    
+    for moves in an:
+        # print(moves)
+        # print(moves['pv'][0])
+        print(moves['score'].relative)
+        # print(moves['score'].relative.mate())
+        # gives score in centipawns
+        # print(moves)
+
+    exit()
 
     print("Starting Position:")
     print(board)
