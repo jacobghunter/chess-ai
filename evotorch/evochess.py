@@ -6,20 +6,23 @@ import torch
 
 import sys
 
-sys.path.append("muzerogeneral/games")
-import abstract_game
-from abstract_game import AbstractGame
+# sys.path.append("muzerogeneral/games")
+# import abstract_game
+from .abstract_game import AbstractGame
 
 import chess
 import chess.engine
 import chess.pgn
+
+ENGINE_PATH = f'/home/judeb/Classproj/chess-ai/stockfish-ubuntu-x86-64-avx2/stockfish/stockfish-ubuntu-x86-64-sse41-popcnt'
+
 class MuZeroConfig:
     def __init__(self):
         # fmt: off
         # More information is available here: https://github.com/werner-duvaud/muzero-general/wiki/Hyperparameter-Optimization
 
         self.seed = 0  # Seed for numpy, torch and the game
-        self.max_num_gpus = None  # Fix the maximum number of GPUs to use. It's usually faster to use a single GPU (set it to 1) if it has enough memory. None will use every GPUs available
+        self.max_num_gpus = 1  # Fix the maximum number of GPUs to use. It's usually faster to use a single GPU (set it to 1) if it has enough memory. None will use every GPUs available
 
 
 
@@ -27,7 +30,7 @@ class MuZeroConfig:
         self.observation_shape = (12, 8, 8)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
         self.action_space = list(range(4096))  # Fixed list of all possible actions. You should only edit the length
         self.players = list(range(2))  # List of players. You should only edit the length
-        self.stacked_observations = 0  # Number of previous observations and previous actions to add to the current observation
+        self.stacked_observations = 1  # Number of previous observations and previous actions to add to the current observation
 
         # Evaluate
         self.muzero_player = 0  # Turn Muzero begins to play (0: MuZero plays first, 1: MuZero plays second)
@@ -38,9 +41,9 @@ class MuZeroConfig:
         ### Self-Play
         self.num_workers = 1  # Number of simultaneous threads/workers self-playing to feed the replay buffer
         self.selfplay_on_gpu = False
-        self.max_moves = 42  # Maximum number of moves if game is not finished before
-        self.num_simulations = 200  # Number of future moves self-simulated
-        self.discount = 1  # Chronological discount of the reward
+        self.max_moves = 200  # Maximum number of moves if game is not finished before
+        self.num_simulations = 7  # Number of future moves self-simulated
+        self.discount = .99  # Chronological discount of the reward
         self.temperature_threshold = None  # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
 
         # Root prior exploration noise
@@ -59,11 +62,11 @@ class MuZeroConfig:
         
         # Residual Network
         self.downsample = False  # Downsample observations before representation network, False / "CNN" (lighter) / "resnet" (See paper appendix Network Architecture)
-        self.blocks = 3  # Number of blocks in the ResNet
+        self.blocks = 6  # Number of blocks in the ResNet
         self.channels = 64  # Number of channels in the ResNet
-        self.reduced_channels_reward = 2  # Number of channels in reward head
-        self.reduced_channels_value = 2  # Number of channels in value head
-        self.reduced_channels_policy = 4  # Number of channels in policy head
+        self.reduced_channels_reward = 6  # Number of channels in reward head
+        self.reduced_channels_value = 6  # Number of channels in value head
+        self.reduced_channels_policy = 12  # Number of channels in policy head
         self.resnet_fc_reward_layers = [64]  # Define the hidden layers in the reward head of the dynamic network
         self.resnet_fc_value_layers = [64]  # Define the hidden layers in the value head of the prediction network
         self.resnet_fc_policy_layers = [64]  # Define the hidden layers in the policy head of the prediction network
@@ -81,8 +84,8 @@ class MuZeroConfig:
         ### Training
         self.results_path = pathlib.Path(__file__).resolve().parents[1] / "results" / pathlib.Path(__file__).stem / datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")  # Path to store the model weights and TensorBoard logs
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
-        self.training_steps = 100  # Total number of training steps (ie weights update according to a batch)
-        self.batch_size = 64  # Number of parts of games to train on at each training step
+        self.training_steps = 10000  # Total number of training steps (ie weights update according to a batch)
+        self.batch_size = 256  # Number of parts of games to train on at each training step
         self.checkpoint_interval = 10  # Number of training steps before using the model for self-playing
         self.value_loss_weight = 0.25  # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
         self.train_on_gpu = torch.cuda.is_available()  # Train on GPU if available
@@ -92,16 +95,16 @@ class MuZeroConfig:
         self.momentum = 0.9  # Used only if optimizer is SGD
 
         # Exponential learning rate schedule
-        self.lr_init = 0.005  # Initial learning rate
-        self.lr_decay_rate = 1  # Set it to 1 to use a constant learning rate
+        self.lr_init = 0.00001  # Initial learning rate
+        self.lr_decay_rate = .999  # Set it to 1 to use a constant learning rate
         self.lr_decay_steps = 10000
 
 
 
         ### Replay Buffer
-        self.replay_buffer_size = 10000  # Number of self-play games to keep in the replay buffer
+        self.replay_buffer_size = 1000  # Number of self-play games to keep in the replay buffer
         self.num_unroll_steps = 42  # Number of game moves to keep for every batch element
-        self.td_steps = 42  # Number of steps in the future to take into account for calculating the target value
+        self.td_steps = 10  # Number of steps in the future to take into account for calculating the target value
         self.PER = True  # Prioritized Replay (See paper appendix Training), select in priority the elements in the replay buffer which are unexpected for the network
         self.PER_alpha = 0.5  # How much prioritization is used, 0 corresponding to the uniform case, paper suggests 1
 
@@ -128,16 +131,17 @@ class MuZeroConfig:
         return 1
     
 def to_actionspace(move: chess.Move):
-    return move.to_square+move.from_square*64
+    return move.to_square+(move.from_square*64)
     
 def from_actionspace(action_space_move: int):
-    return chess.Move(action_space_move%64,action_space_move//64)
-
+    return chess.Move((action_space_move//64),(action_space_move%64))
 
 class Game(AbstractGame):
     def __init__(self, seed=None):
         self.board : chess.Board = chess.Board()
         self.player = 1
+        self.engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+        self.limit = chess.engine.Limit(depth=10)
 
     def step(self, action):
         """
@@ -149,21 +153,41 @@ class Game(AbstractGame):
         Returns:
             The new observation, the reward and a boolean if the game has ended.
         """
-
+        reward = 0
         next_move : chess.Move = from_actionspace(action)
-
-        if not self.board.is_legal(next_move):
-           next_move = chess.Move(next_move.from_square,next_move.to_square,promotion=chess.QUEEN)
-        if not self.board.is_legal(next_move):
-            next_move = self.board.generate_legal_moves().__next__()
-            print("AUTO MOVE")
-        
-        print(next_move)
-        self.board.push(next_move)
+        if not self.board.is_checkmate():
+            if not self.board.is_legal(next_move):
+                next_move = chess.Move(next_move.from_square,next_move.to_square,promotion=chess.QUEEN)
+            if not self.board.is_legal(next_move):
+                next_move = self.board.generate_legal_moves().__next__()
+            self.board.push(next_move)
+        else:
+            reward = -1000
+            
 
         done = self.board.is_checkmate() or self.board.can_claim_draw() or len(self.legal_actions()) == 0
 
-        reward = 1 if self.board.is_checkmate() else 0
+        info = self.engine.analyse(self.board, chess.engine.Limit(time=0.1))
+
+        score = info["score"].relative
+
+        if score.is_mate():
+            # returns moves to mate
+            score = score.mate()
+
+            # scaling score based on how many moves to mate
+            # this means a m5 will be 50CP, and a m1 will be 90CP, m>8 =100
+            if(score<10):
+                score = 100 + -score * 10
+            else:
+                score = 10
+        else:
+            score = -1*score.score()
+
+        reward+= score * (5/(5+self.board.fullmove_number))
+
+
+        reward += 1000 if self.board.is_checkmate() else 0
 
         self.player *= -1
 
@@ -233,15 +257,16 @@ class Game(AbstractGame):
              queen_black,
              king_black])
 
-    async def render(self):
+    def render(self):
         """
         Display the game observation.
         """
-        print(chess.svg.board(
-            self.board,
-            size=350,
-        ) )
-        await input("Press enter to take a step ")
+        print(self.board)
+        # print(chess.svg.board(
+        #     self.board,
+        #     size=350,
+        # ) )
+        input("Press enter to take a step ")
 
     def human_to_action(self):
         """
@@ -251,13 +276,30 @@ class Game(AbstractGame):
         Returns:
             An integer from the action space.
         """
-        choice = input(f"Enter the standard chess notation moves, here are the legal moves")
+
         for i in self.board.generate_legal_moves():
             print(i)
+        choice = input(f"Enter the standard chess notation moves, here are the legal moves")
+        
+        move = self.getPlayerMove(choice)
+        print("Chose: "+choice.__str__())
+        return to_actionspace(move)
+        
+    def getPlayerMove(self, choice):
+        move = choice
+        try: 
+            move = chess.Move.from_uci(move)
+        except:
+            move = chess.Move.from_uci("h1h2")
 
-        while not self.board.is_legal(chess.Move.from_uci(choice)):
-            choice = input("Enter another move : ")
-        return to_actionspace(chess.Move.from_uci(choice))
+        while not self.board.is_legal(move):
+            move = input("Enter another move : ")
+            try: 
+                move = chess.Move.from_uci(move)
+            except:
+                move = chess.Move.from_uci("h1h2")
+
+        return move
 
     def expert_agent(self):
         """
@@ -267,8 +309,8 @@ class Game(AbstractGame):
         Returns:
             Action as an integer to take in the current game state
         """
-        result = chess.engine.play(self.board, chess.engine.Limit(
-        time=0.0001))
+        result = self.engine.play(self.board, chess.engine.Limit(
+        time=0.01))
         return to_actionspace(result.move)
 
     def action_to_string(self, action_number):
@@ -282,3 +324,4 @@ class Game(AbstractGame):
             String representing the action.
         """
         return from_actionspace(action_number).__str__()
+    
